@@ -30,6 +30,12 @@ from thingsboard_gateway.tb_utility.tb_loader import TBModuleLoader
 from thingsboard_gateway.gateway.statistics.statistics_service import StatisticsService
 from thingsboard_gateway.connectors.socket.socket_decorators import CustomCollectStatistics
 from thingsboard_gateway.tb_utility.tb_logger import init_logger
+from thingsboard_gateway.gateway.entities.rpc_request import RPCType
+from thingsboard_gateway.gateway.entities.rpc_response import RPCResponse
+from thingsboard_gateway.connectors.socket.constants import (
+    SET_PATTERN_REGEX,
+    SET_RPC_EXPECTED_SCHEMA
+)
 
 SOCKET_TYPE = {
     'TCP': socket.SOCK_STREAM,
@@ -194,7 +200,7 @@ class SocketConnector(Connector, Thread):
                 self.__bind = True
 
         if self.__stopped:
-             return
+            return
 
         if self.__socket_type == 'TCP':
             self.__socket.listen(5)
@@ -256,16 +262,16 @@ class SocketConnector(Connector, Thread):
                             equal = data
                             if attr['haveIndex']:
                                 if attr.get('requestIndexFrom') and attr.get('requestIndexTo'):
-                                    index_from = int(attr['requestIndexFrom']) if attr['requestIndexFrom'] != '' else None
+                                    index_from = int(attr['requestIndexFrom']) if attr['requestIndexFrom'] != '' else None  # noqa
                                     index_to = int(attr['requestIndexTo']) if attr['requestIndexTo'] != '' else None
                                     equal = data[index_from:index_to]
                                 else:
                                     equal = data[int(attr['requestIndex'])]
-    
+
                             if attr['requestEqual'] == equal.decode('utf-8'):
                                 is_attribute_request = True
                                 self.__process_attribute_request(device['deviceName'], attr, data)
-    
+
                         if is_attribute_request:
                             continue
 
@@ -336,12 +342,11 @@ class SocketConnector(Connector, Thread):
         address, port = device['address'].split(':')
 
         value = response.get('value') or response.get('values')
-        converted_value = bytes(dumps(value), encoding='utf-8')
 
         if self.__socket_type == 'TCP':
-            self.__write_value_via_tcp(address, port, converted_value)
+            self.__write_value_via_tcp(address, port, dumps(value))
         else:
-            self.__write_value_via_udp(address, port, converted_value)
+            self.__write_value_via_udp(address, port, bytes(dumps(value), encoding='utf-8'))
         self.statistics['MessagesSent'] = self.statistics['MessagesSent'] + 1
 
     def close(self):
@@ -377,20 +382,20 @@ class SocketConnector(Connector, Thread):
         return self.__id
 
     @CustomCollectStatistics(start_stat_type='allBytesSentToDevices')
-    def __write_value_via_tcp(self, address, port, value):
+    def __write_value_via_tcp(self, address, port, value, encoding='utf-8'):
         try:
-            self.__connections[(address, int(port))].sendall(bytes(value, encoding='utf-8'))
+            self.__connections[(address, int(port))].sendall(bytes(value, encoding=encoding))
             return 'ok'
         except KeyError:
             try:
                 new_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 new_socket.connect((address, int(port)))
-                new_socket.sendall(value)
+                new_socket.sendall(bytes(value, encoding=encoding))
                 new_socket.close()
                 return 'ok'
             except ConnectionRefusedError as e:
                 self.__log.error('Can\'t connect to %s:%s\n %s', address, port, e)
-                return e
+                return str(e)
 
     @staticmethod
     @CollectStatistics(start_stat_type='allBytesSentToDevices')
@@ -408,82 +413,120 @@ class SocketConnector(Connector, Thread):
                 for attribute_update in content['data']:
                     if attribute_update_config['attributeOnThingsBoard'] == attribute_update:
                         address, port = device['address'].split(':')
+
                         encoding = device.get('encoding', 'utf-8').lower()
-                        converted_data = bytes(str(content['data'][attribute_update]), encoding=encoding)
-                        self.__write_value_via_tcp(address, port, converted_data)
+                        if attribute_update_config.get('encoding') is not None:
+                            encoding = attribute_update_config['encoding']
+
+                        self.__write_value_via_tcp(address,
+                                                   port,
+                                                   str(content['data'][attribute_update]),
+                                                   encoding=encoding)
         except IndexError:
             self.__log.error('Device not found')
 
     @CollectAllReceivedBytesStatistics(start_stat_type='allReceivedBytesFromTB')
-    def server_side_rpc_handler(self, content):
+    def server_side_rpc_handler(self, rpc_request) -> RPCResponse:
+        response = RPCResponse(rpc_request.id, device=rpc_request.device_name)
+
         try:
-            if content.get('data') is None:
-                content['data'] = {'params': content['params'], 'method': content['method']}
-
-            rpc_method = content['data']['method']
-
-            # check if RPC type is connector RPC (can be only 'set')
-            try:
-                (connector_type, rpc_method_name) = rpc_method.split('_')
-                if connector_type == self._connector_type:
-                    rpc_method = rpc_method_name
-                    content['device'] = content['params'].split(' ')[0].split('=')[-1]
-            except (IndexError, ValueError):
-                pass
-
-            device = tuple(filter(lambda item: item['deviceName'] == content['device'], self.__config['devices']))[0]
-
-            # check if RPC method is reserved set
-            if rpc_method == 'set':
-                params = {}
-                for param in content['data']['params'].split(';'):
-                    try:
-                        (key, value) = param.split('=')
-                    except ValueError:
-                        continue
-
-                    if key and value:
-                        params[key] = value
-
-                result = None
-                try:
-                    if self.__socket_type == 'TCP':
-                        result = self.__write_value_via_tcp(params['address'], int(params['port']), params['value'])
-                    else:
-                        self.__write_value_via_udp(params['address'], int(params['port']), params['value'])
-                except KeyError:
-                    self.__gateway.send_rpc_reply(device=device['deviceName'], req_id=content['data'].get('id'),
-                                                  content={'result': 'Not enough params'})
-                except ValueError:
-                    self.__gateway.send_rpc_reply(device=device['deviceName'], req_id=content['data']['id'],
-                                                  content={'result': 'Param "port" have to be int type'})
-                else:
-                    self.__gateway.send_rpc_reply(device=device['deviceName'],
-                                                  req_id=content['data'].get('id'),
-                                                  content={'result': str(result)})
+            if rpc_request.rpc_type == RPCType.CONNECTOR:
+                return self._process_rpc_to_connector(rpc_request)
+            elif rpc_request.rpc_type == RPCType.RESERVED:
+                return self._process_reserved_rpc(rpc_request)
+            elif rpc_request.rpc_type == RPCType.DEVICE:
+                return self._process_rpc_to_device(rpc_request)
             else:
-                for rpc_config in device['serverSideRpc']:
-                    for (key, value) in content['data'].items():
-                        if value == rpc_config['methodRPC']:
-                            rpc_method = rpc_config['methodProcessing']
-                            return_result = rpc_config['withResponse']
-                            result = None
-
-                            address, port = device['address'].split(':')
-                            encoding = device.get('encoding', 'utf-8').lower()
-                            converted_data = bytes(str(content['data']['params']), encoding=encoding)
-
-                            if rpc_method.upper() == 'WRITE':
-                                if self.__socket_type == 'TCP':
-                                    result = self.__write_value_via_tcp(address, port, converted_data)
-                                else:
-                                    self.__write_value_via_udp(address, port, converted_data)
-
-                            if return_result and self.__socket_type == 'TCP':
-                                self.__gateway.send_rpc_reply(content['device'], content['data']['id'], {'result': str(result)})
-
-                            return
-        except IndexError:
-            self.__log.error('Device not found')
+                response.set_error_msg(f"Invalid RPC type request: {rpc_request}")
+                return response
         except Exception as e:
-            self.__log.exception(e)
+            error_msg = f"Failed to process RPC with error: {e}"
+            self.__log.error(error_msg)
+
+            response.set_error_msg(error_msg)
+            return response
+
+    def _process_rpc_to_connector(self, rpc_request):
+        response = RPCResponse(rpc_request.id, device=rpc_request.device_name)
+        response.set_error_msg('RPC To Connector not implemented for Socket connector')
+        return response
+
+    def _process_reserved_rpc(self, rpc_request):
+        response = RPCResponse(rpc_request.id, device=rpc_request.device_name)
+
+        if rpc_request.method_name != 'set':
+            response.set_error_msg('Only `set` method is supported')
+            return response
+
+        set_pattern = compile(SET_PATTERN_REGEX)
+
+        match = set_pattern.match(rpc_request.params)
+        if not match:
+            response.set_error_msg(f'The requested RPC either does not match with the schema {SET_RPC_EXPECTED_SCHEMA} or incorrect value/values provided')  # noqa
+            return response
+
+        config = match.groupdict()
+        result = self._write_value(config['address'],
+                                   config['port'],
+                                   config['value'],
+                                   encoding=config.get('encoding', 'utf-8'))
+        if result is None:
+            response.set_message('Success')
+        else:
+            response.set_message(result)
+
+        return response
+
+    def _process_rpc_to_device(self, rpc_request):
+        response = RPCResponse(rpc_request.id, device=rpc_request.device_name)
+
+        device_config = self._find_device_config_by_name(rpc_request.device_name)
+        if device_config is None:
+            response.set_error_msg(f'Device {rpc_request.device_name} not found')
+            return response
+
+        rpc_config = self._find_rpc_config(device_config, rpc_request.method_name)
+        if rpc_config is None:
+            response.set_error_msg(f'RPC method {rpc_request.method_name} config not found')
+            return response
+
+        if rpc_request.params is None:
+            response.set_error_msg('Nothing to write. Params are empty.')
+            return response
+
+        address, port = device_config['address'].split(':')
+
+        encoding = device_config.get('encoding', 'utf-8')
+        if rpc_config.get('encoding') is not None:
+            encoding = rpc_config['encoding']
+
+        result = self._write_value(address, port, rpc_request.params, encoding=encoding)
+        if result is None:
+            response.set_message('Success')
+        else:
+            response.set_message(result)
+
+        return response
+
+    def _find_device_config_by_name(self, device_name):
+        device_list = tuple(filter(lambda item: item['deviceName'] == device_name, self.__config['devices']))
+        if len(device_name) == 0:
+            return None
+
+        return device_list[0]
+
+    def _find_rpc_config(self, device_config, rpc_method_name):
+        for rpc_config in device_config['serverSideRpc']:
+            if rpc_config['methodRPC'] == rpc_method_name:
+                return rpc_config
+
+        return None
+
+    def _write_value(self, address, port, converted_data, encoding='utf-8'):
+        result = None
+        if self.__socket_type == 'TCP':
+            result = self.__write_value_via_tcp(address, port, converted_data, encoding=encoding)
+        else:
+            self.__write_value_via_udp(address, port, converted_data)
+
+        return result

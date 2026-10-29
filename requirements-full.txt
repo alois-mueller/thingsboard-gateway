@@ -15,7 +15,7 @@ mmh3
 protobuf
 cachetools
 tb-paho-mqtt-client>=2.1.2
-tb-mqtt-client==1.13.13
+tb-mqtt-client==1.13.14
 service-identity
 psutil
 cryptography
@@ -27,7 +27,8 @@ pymodbus==3.9.2
 pyserial
 pyserial-asyncio
 paho-mqtt
-ocpp
+ocpp==2.1.0
+websockets==17.1
 pyodbc
 asyncua==1.1.5
 requests
@@ -36,3 +37,5 @@ puresnmp>=2.0.0
 slixmpp
 wheel
 PySocks
+python-snap7==3.1.2
+slixmpp==1.8.6

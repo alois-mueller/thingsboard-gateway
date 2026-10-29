@@ -45,7 +45,7 @@ class BytesModbusUplinkConverter(ModbusConverter):
             'attributes': result.add_to_attributes,
             'telemetry': result.add_to_telemetry
         }
-        
+
         received_data_ts = int(time() * 1000)
 
         for device_data in data:
@@ -88,7 +88,8 @@ class BytesModbusUplinkConverter(ModbusConverter):
     def __process_wide_range_response(self, config, encoded_data):
         encoded_data = self.__validate_wide_range_encoded_data(encoded_data)
         registers_data = self.__get_registers_from_wide_range_encoded_data(encoded_data,
-                                                                           config['functionCode'])
+                                                                           config['functionCode'],
+                                                                           config['type'])
         datapoints = self.__process_wide_range_response_encoded_data(config, registers_data)
         return datapoints
 
@@ -105,11 +106,11 @@ class BytesModbusUplinkConverter(ModbusConverter):
 
         return encoded_data
 
-    def __get_registers_from_wide_range_encoded_data(self, encoded_data, function_code):
+    def __get_registers_from_wide_range_encoded_data(self, encoded_data, function_code, data_type):
         registers_data = []
 
         for chunk in encoded_data:
-            registers_chunk = Utils.get_registers_from_encoded_data(chunk, function_code)
+            registers_chunk = Utils.get_registers_from_encoded_data(chunk, function_code, data_type)
             registers_data.extend(registers_chunk)
 
         return registers_data
@@ -278,10 +279,30 @@ class BytesModbusUplinkConverter(ModbusConverter):
         decoded = None
 
         if lower_type in ['bit', 'bits']:
-            decoded = decoder_functions[lower_type]()
-            decoded_lastbyte = decoder_functions[lower_type]()
-            decoded += decoded_lastbyte
-            decoded = decoded[len(decoded)-objects_count:]
+            is_register_function = configuration.get('functionCode') in (3, 4)
+            select_single_bit = configuration.get('bit') is not None
+
+            # For holding/input registers (FC3/4), objectsCount drives how many registers are
+            # requested from the device, not how many bits to keep. When selecting a single bit
+            # from register data, decode all bits of every requested register instead of only
+            # the first one, so that any bit index within that range can be addressed.
+            if select_single_bit and is_register_function:
+                bytes_to_decode = max(objects_count, 1) * 2
+            else:
+                bytes_to_decode = 2
+
+            decoded = []
+            for _ in range(bytes_to_decode):
+                byte_bits = decoder_functions[lower_type]()
+                if not is_register_function:
+                    # BinaryPayloadDecoder.fromCoils() (used for coils/discrete inputs) reverses
+                    # the bit order within each decoded byte relative to the original coil
+                    # order, so undo that reversal before concatenating.
+                    byte_bits = byte_bits[::-1]
+                decoded += byte_bits
+
+            if not select_single_bit:
+                decoded = decoded[:objects_count]
 
         elif lower_type == "string":
             decoded = decoder_functions[lower_type](objects_count * 2)

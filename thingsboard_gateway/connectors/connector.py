@@ -13,6 +13,17 @@
 #     limitations under the License.
 
 from abc import ABC, abstractmethod
+from threading import Thread
+from time import sleep
+
+from thingsboard_gateway.tb_utility.tb_logger import init_logger
+
+from thingsboard_gateway.gateway.entities.rpc_request import (
+    ReservedRPCRequest,
+    DeviceRPCRequest,
+    ConnectorRPCRequest
+)
+from thingsboard_gateway.gateway.entities.rpc_response import RPCResponse
 
 
 class Connector(ABC):
@@ -54,5 +65,80 @@ class Connector(ABC):
         pass
 
     @abstractmethod
-    def server_side_rpc_handler(self, content):
+    def server_side_rpc_handler(self, rpc_request: DeviceRPCRequest | ReservedRPCRequest | ConnectorRPCRequest) -> RPCResponse:  # noqa
         pass
+
+
+class DummyCustomConnector(Connector, Thread):
+    """Placeholder connector started instead of a custom connector whose class could not be
+    loaded (e.g. wrong or missing "class" name in the configuration), so the gateway still
+    starts and keeps reporting the reason in the logs instead of silently dropping it."""
+
+    WARNING_PERIOD_SECONDS = 60
+
+    def __init__(self, gateway, config, connector_type):
+        super().__init__()
+        self.daemon = True
+        self._gateway = gateway
+        self._config = config
+        self._connector_type = connector_type
+        self.name = config.get('name')
+        self.__log = init_logger(self._gateway, self.name,
+                                 self._config.get('logLevel', 'INFO'),
+                                 enable_remote_logging=self._config.get('enableRemoteLogging', False),
+                                 is_connector_logger=True)
+        self.__stopped = True
+        self.__connected = False
+
+    def open(self):
+        self.__stopped = False
+        self.start()
+
+    def _get_requested_class_name(self):
+        for connector_config in self._gateway.config.get('connectors', []):
+            if connector_config.get('name') == self.get_name():
+                return connector_config.get('class')
+        return None
+
+    def run(self):
+        self.__connected = True
+        while not self.__stopped:
+            self.__log.error(
+                "Connector '%s' is not implemented: class '%s' was not found. "
+                "Implement the real custom connector class to start receiving/sending data.",
+                self.get_name(), self._get_requested_class_name())
+            sleep(self.WARNING_PERIOD_SECONDS)
+
+    def close(self):
+        self.__stopped = True
+        self.__connected = False
+
+    def get_id(self):
+        return self._config.get('id')
+
+    def get_name(self):
+        return self.name
+
+    def get_type(self):
+        return self._connector_type
+
+    def get_config(self):
+        return self._config
+
+    def is_connected(self):
+        return self.__connected
+
+    def is_stopped(self):
+        return self.__stopped
+
+    def on_attributes_update(self, content):
+        pass
+
+    def server_side_rpc_handler(self, rpc_request):
+        self.__log.error(
+            "Cannot process RPC request for connector '%s': real custom connector class '%s' is not implemented.",
+            self.get_name(), self._get_requested_class_name())
+        response = RPCResponse(rpc_request.id, device=rpc_request.device_name)
+        response.set_error_msg(f"Custom connector '{self.get_name()}' is not implemented.")
+        return response
+

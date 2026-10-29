@@ -48,6 +48,8 @@ class DeviceConfig(ABC):
         self.datapoints = config['datapoints']
         self.server_side_rpc = config.get('serverSideRpc', [])
         self.attributes_updates = config.get('attributeUpdates', [])
+        self.shared_attributes_keys = [attribute_update_config['key']
+                                       for attribute_update_config in self.attributes_updates]
 
     def _format_base_config(self, config: dict) -> None:
         """
@@ -83,6 +85,11 @@ class DeviceConfig(ABC):
             self._log.warning(
                 f"Invalid pollPeriod value for device '{device_name}'. Using default value: {DEFAULT_POLL_PERIOD} ms")
             config['pollPeriod'] = DEFAULT_POLL_PERIOD
+
+        if config.get('heartbeatInterval', DEFAULT_HEARTBEAT_INTERVAL) <= 0:
+            self._log.warning(
+                f"Invalid heartbeatInterval value for device '{device_name}'. Using default value: {DEFAULT_HEARTBEAT_INTERVAL}")  # noqa: E501
+            config['heartbeatInterval'] = DEFAULT_HEARTBEAT_INTERVAL
 
     def _validate_datapoint_config_section(self, config_section, config_section_type):
         result = []
